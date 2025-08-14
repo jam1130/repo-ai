@@ -1,0 +1,7 @@
+gradio>=4.44.1
+fastapi>=0.111
+uvicorn[standard]>=0.30
+stripe>=7.8
+python-dotenv>=1.0
+requests>=2.31
+openai>=1.40.0

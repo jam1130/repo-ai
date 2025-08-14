@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: repo-deploy-assistant
+    env: python
+    plan: free
+    buildCommand: |
+      pip install -U pip && pip install -r requirements.txt
+    startCommand: |
+      uvicorn app:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: APP_BASE_URL
+        value: https://RENDER_GENERATED_URL   # 部署后到控制台把它改成实际URL
+      - key: DB_PATH
+        value: ./app.db                       # 免费层无持久盘，演示可先这样
+      - key: LLM_PROVIDER
+        value: volcano
+      - key: VOLCANO_MODEL
+        value: doubao-pro-128k                # 或你自己的模型/接入点ID
+      # VOLCANO_API_KEY / 其它密钥不要写在这里，去控制台以“Secret file/Env Var”添加
