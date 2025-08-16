@@ -1,5 +1,6 @@
-# app.py —— 修复：用浏览器JS读取登录Cookie；Magic Link 登录；试用=3；Paddle；/ui 挂载
-import os, re, hmac, json, time, secrets, sqlite3, hashlib, tempfile
+# app.py —— OTP 登录 / 试用3次 / Paddle / Render 友好 / UI 提升
+import os, re, hmac, json, time, secrets, sqlite3, hashlib, tempfile, ssl, smtplib
+from email.mime.text import MIMEText
 from datetime import datetime
 from urllib.parse import quote_plus
 
@@ -9,19 +10,27 @@ load_dotenv()
 from fastapi import FastAPI, Request, Cookie
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+
 import gradio as gr
 
+# 业务能力（你自己的逻辑）
 from utils import analyze_repo, generate_guide, troubleshoot
 
-# ---------- 配置 ----------
+# ----------------- 基础配置 -----------------
 APP_BASE_URL = os.getenv("APP_BASE_URL", "http://127.0.0.1:7860").rstrip("/")
 DB_PATH = os.getenv("DB_PATH", "./app.db")
+
 SECRET_KEY = os.getenv("SECRET_KEY", "CHANGE_ME_IN_PROD")
 SESSION_COOKIE = "repoai_session"
 
-PADDLE_CLIENT_TOKEN = os.getenv("PADDLE_CLIENT_TOKEN", "").strip()
-PADDLE_PRICE_BASIC  = os.getenv("PADDLE_PRICE_BASIC", "").strip()
-PADDLE_PRICE_PRO    = os.getenv("PADDLE_PRICE_PRO", "").strip()
+# 试用/扣次
+TRIAL_CREDITS = 3
+CREDITS_COST_PER_RUN = 1
+
+# Paddle（以后开通）
+PADDLE_CLIENT_TOKEN   = os.getenv("PADDLE_CLIENT_TOKEN", "").strip()
+PADDLE_PRICE_BASIC    = os.getenv("PADDLE_PRICE_BASIC", "").strip()
+PADDLE_PRICE_PRO      = os.getenv("PADDLE_PRICE_PRO", "").strip()
 PADDLE_WEBHOOK_SECRET = os.getenv("PADDLE_WEBHOOK_SECRET", "").strip()
 
 PLAN_CREDIT_MAP = {
@@ -30,13 +39,10 @@ PLAN_CREDIT_MAP = {
 }
 PRICEID_TO_PLAN = {v["price_id"]: (k, v["credits"]) for k, v in PLAN_CREDIT_MAP.items() if v["price_id"]}
 
-CREDITS_COST_PER_RUN = 1
-TRIAL_CREDITS = 3
-
 def _is_https(url: str) -> bool:
     return url.lower().startswith("https://")
 
-# ---------- SQLite ----------
+# ----------------- SQLite -----------------
 def db():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
@@ -61,6 +67,15 @@ def init_db():
         email TEXT,
         expires_at INTEGER,
         used INTEGER DEFAULT 0
+    )""")
+    # OTP 验证码
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS otp_codes(
+        email TEXT,
+        code TEXT,
+        created_at INTEGER,
+        expires_at INTEGER,
+        PRIMARY KEY (email, code)
     )""")
     conn.commit(); conn.close()
 
@@ -100,7 +115,7 @@ def mark_event_processed(event_id: str) -> bool:
     finally:
         conn.close()
 
-# ---------- Magic Link ----------
+# ----------------- 签名/会话 -----------------
 def _sign(value: str) -> str:
     sig = hmac.new(SECRET_KEY.encode(), value.encode(), hashlib.sha256).hexdigest()
     return f"{value}.{sig}"
@@ -114,33 +129,55 @@ def _unsign(signed: str | None) -> str | None:
     except Exception:
         return None
 
-def create_magic_token(email: str, ttl_seconds: int = 15*60) -> str:
-    token = secrets.token_urlsafe(32)
-    expires = int(time.time()) + ttl_seconds
-    conn = db()
-    conn.execute("INSERT OR REPLACE INTO auth_tokens(token,email,expires_at,used) VALUES(?,?,?,0)",
-                 (token, email, expires))
-    conn.commit(); conn.close()
-    return token
+# ----------------- 发送验证码 -----------------
+def send_email_otp(to_email: str, code: str) -> bool:
+    host = os.getenv("SMTP_HOST", "")
+    port = int(os.getenv("SMTP_PORT", "0") or 0)
+    user = os.getenv("SMTP_USER", "")
+    pwd  = os.getenv("SMTP_PASS", "")
+    sender = os.getenv("SMTP_FROM", "")
 
-def use_magic_token(token: str) -> str | None:
-    conn = db(); cur = conn.execute("SELECT email,expires_at,used FROM auth_tokens WHERE token=?", (token,))
-    row = cur.fetchone()
-    if not row: conn.close(); return None
-    email, exp, used = row["email"], row["expires_at"], row["used"]
-    if used or time.time() > exp: conn.close(); return None
-    conn.execute("UPDATE auth_tokens SET used=1 WHERE token=?", (token,))
-    conn.commit(); conn.close()
-    return email
+    subject = "你的登录验证码"
+    html = f"<p>你的验证码是：<b style='font-size:18px'>{code}</b> ，10 分钟内有效。</p>"
 
-# ---------- 业务辅助 ----------
+    if not (host and port and user and pwd and sender):
+        # 测试环境：直接打印出来，页面也会提示（方便无 SMTP 时使用）
+        print(f"[DEV] OTP for {to_email} = {code}")
+        return False
+
+    try:
+        msg = MIMEText(html, "html", "utf-8")
+        msg["Subject"] = subject
+        msg["From"] = sender
+        msg["To"] = to_email
+
+        context = ssl.create_default_context()
+        with smtplib.SMTP_SSL(host, port, context=context) as server:
+            server.login(user, pwd)
+            server.sendmail(sender, [to_email], msg.as_string())
+        return True
+    except Exception as e:
+        print("send_email_otp error:", e)
+        return False
+
+# ----------------- App 状态与工具 -----------------
 def init_state():
-    return {"repo_data": None, "history": [], "user_env": "Windows",
-            "steps": [], "titles": [], "codes": [], "warnings": [],
-            "user_email": "", "user_credits": 0}
+    return {
+        "repo_data": None,
+        "history": [],
+        "user_env": "Windows",
+        "steps": [],
+        "titles": [],
+        "codes": [],
+        "warnings": [],
+        "user_email": "",
+        "user_credits": 0,
+    }
 
-_DANGEROUS = [r"\brm\s+-rf\s+\/\s*$", r"\brm\s+-rf\s+\*", r"\bmkfs\.|\bmkfs\b", r"\bdd\s+if=", r"\bformat\s+[A-Za-z]:",
-              r"\bdel\s+\/s\s+\/q\s+[A-Za-z]:\\"]
+_DANGEROUS = [
+    r"\brm\s+-rf\s+\/\s*$", r"\brm\s+-rf\s+\*", r"\bmkfs\.|\bmkfs\b", r"\bdd\s+if=",
+    r"\bformat\s+[A-Za-z]:", r"\bdel\s+\/s\s+\/q\s+[A-Za-z]:\\"
+]
 
 def extract_code_snippets(t: str):
     if not t: return []
@@ -179,7 +216,7 @@ def split_steps(t: str):
     fb = re.findall(r"\d+\.[\s\S]*?(?=\n\d+\. |\n\d+\.|$)", n)
     return [s.strip() for s in (fb or [n.strip()]) if s.strip()]
 
-# ---------- 导出 ----------
+# ----------------- 导出 -----------------
 def export_markdown(state):
     steps = state.get("steps") or []
     repo = (state.get("repo_data") or {}).get("url", "")
@@ -216,12 +253,12 @@ def export_json(state):
                "steps": state.get("steps") or [],
                "commands": state.get("codes") or [],
                "generated_at": datetime.utcnow().isoformat()+"Z",
-               "version": "mvp-1.4"}
+               "version": "mvp-1.5"}
     f = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
     f.write(json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")); f.flush(); f.close()
     return gr.update(value=f.name, visible=True)
 
-# ---------- Paddle 验签 ----------
+# ----------------- Paddle 验签 -----------------
 def verify_paddle_signature(signature_header: str, raw_body: bytes) -> bool:
     if not signature_header or not PADDLE_WEBHOOK_SECRET: return False
     try:
@@ -234,13 +271,13 @@ def verify_paddle_signature(signature_header: str, raw_body: bytes) -> bool:
     except Exception:
         return False
 
-# ---------- 主业务 ----------
+# ----------------- 主逻辑 -----------------
 def start_analysis(url, env, state):
     email = (state or {}).get("user_email") or ""
     credits = int((state or {}).get("user_credits") or 0)
     if CREDITS_COST_PER_RUN > 0:
         if not email:
-            msg = "请先登录：输入邮箱 → 点击“发送登录链接” → 点击返回的链接完成登录 → 页面会自动识别。"
+            msg = "请先登录：输入邮箱 → 发送验证码 → 填码登录；登录后页面会自动显示账户。"
             return [("系统", msg)], gr.update(), state, gr.update(value=""), gr.update(value=""), gr.update(value="")
         if credits < CREDITS_COST_PER_RUN:
             return [("系统", f"次数不足（剩余 {credits}）。请先购买或领取试用。")], gr.update(), state, gr.update(value=""), gr.update(value=""), gr.update(value="")
@@ -309,7 +346,7 @@ def guided_diagnose(issue, history, state):
 
 def make_pay_link(plan, state):
     email = state.get("user_email") or ""
-    if not email: return gr.update(value="请先登录（页面右上）")
+    if not email: return gr.update(value="请先登录（页面顶部）")
     info = PLAN_CREDIT_MAP.get(plan)
     if not info or not info["price_id"]: return gr.update(value=f"{plan} 未配置 priceId。")
     url = f"{APP_BASE_URL}/paddle/checkout/{plan.lower()}?email={quote_plus(email)}"
@@ -317,7 +354,7 @@ def make_pay_link(plan, state):
 
 def claim_trial(state):
     email = state.get("user_email") or ""
-    if not email: return gr.update(value="请先完成登录。"), state
+    if not email: return gr.update(value="请先登录。"), state
     u = get_user(email)
     if u and int(u.get("trial_used",0))==0:
         add_credits(email, TRIAL_CREDITS); set_trial_used(email)
@@ -325,28 +362,45 @@ def claim_trial(state):
         return gr.update(value=f"🎁 试用已到账 +{TRIAL_CREDITS} 次，当前余额：{state['user_credits']}"), state
     return gr.update(value="试用已领取过，无法重复领取。"), state
 
-# ---------- Gradio UI ----------
-theme = gr.themes.Soft(primary_hue="indigo", secondary_hue="violet", neutral_hue="slate")
+# ----------------- Gradio UI（更“产品化”） -----------------
 CSS = """
-#header h1{margin-bottom:4px;} #header p{margin-top:0;color:#6b7280;}
+/* 容器宽度 & 字体权重 */
+.gradio-container{max-width:1080px !important;}
+#header{padding:8px 0 2px;}
+#header h1{font-weight:800;letter-spacing:.3px;margin:0 0 6px;}
+#header p{color:#64748b;margin:0 0 10px;}
+/* 卡片阴影与圆角（Blocks默认容器）*/
+div.svelte-17v6c60, .border, .gr-group{border-radius:16px; box-shadow:0 8px 28px rgba(15,23,42,.08);}
+button.svelte- {font-weight:600;}
+/* 右侧滚动 */
 #right_pane{max-height:calc(100vh - 220px);overflow-y:auto;}
 #checklist{max-height:520px;overflow-y:auto;padding-right:8px}
 """
 
-with gr.Blocks(title="Repo AI 助手", theme=theme, css=CSS) as demo:
+theme = gr.themes.Soft(
+    primary_hue="indigo", secondary_hue="violet", neutral_hue="slate"
+).set(
+    button_primary_background_fill="*primary_600",
+    button_primary_background_fill_hover="*primary_700",
+    button_primary_text_color="white",
+    block_border_width="1px",
+    block_border_color="*neutral_200",
+)
+
+with gr.Blocks(title="Repo AI 部署助手", css=CSS, theme=theme) as demo:
     gr.Markdown("""
-    <div id='header'><h1>GitHub Repo 部署助手</h1>
-    <p>邮箱登录，生成部署清单与步骤；支持试用与 Paddle 充值。</p></div>""")
+    <div id='header'>
+      <h1>GitHub Repo 部署助手</h1>
+      <p>输入仓库地址，自动生成一键部署清单与逐步指南。支持邮箱登录、试用与 Paddle 充值。</p>
+    </div>
+    """)
 
     with gr.Row():
-        login_email = gr.Textbox(label="登录邮箱", placeholder="you@example.com", scale=6)
-        send_link_btn = gr.Button("发送登录链接（Magic Link）", variant="primary", scale=3)
-        load_session_btn = gr.Button("从登录状态加载", scale=2)
-
-    # 隐藏：给JS写入，再触发Python更新状态
-    email_hidden = gr.Textbox(visible=False)
-    credits_hidden = gr.Textbox(visible=False)
-
+        login_email = gr.Textbox(label="登录邮箱", placeholder="you@example.com", scale=4)
+        send_code_btn = gr.Button("发送验证码", variant="primary", scale=2)
+        otp_input = gr.Textbox(label="验证码", placeholder="输入 6 位数字", max_lines=1, scale=2)
+        verify_btn = gr.Button("登录", variant="secondary", scale=1)
+        load_session_btn = gr.Button("从登录状态加载", scale=1)
     acct_badge = gr.Markdown("**账户：未登录 | 剩余次数：0**")
     trial_btn = gr.Button(f"领取试用 +{TRIAL_CREDITS} 次")
     pay_msg = gr.Markdown("")
@@ -359,9 +413,10 @@ with gr.Blocks(title="Repo AI 助手", theme=theme, css=CSS) as demo:
     with gr.Row():
         with gr.Column(scale=7):
             chatbot = gr.Chatbot(label="交互指导", height=520)
+
             with gr.Accordion("错误诊断向导（可选）", open=False):
                 issue_select = gr.Dropdown(label="选择一个常见问题类型",
-                    choices=["依赖安装失败","CUDA/显卡相关","端口被占用","环境变量问题","权限/路径问题","其他"])
+                  choices=["依赖安装失败","CUDA/显卡相关","端口被占用","环境变量问题","权限/路径问题","其他"])
                 diagnose_btn = gr.Button("一键生成排查步骤")
 
             with gr.Row():
@@ -394,21 +449,44 @@ with gr.Blocks(title="Repo AI 助手", theme=theme, css=CSS) as demo:
             with gr.Accordion("安全提示", open=False):
                 warnings_md = gr.Markdown(value="")
             with gr.Accordion("使用小贴士", open=False):
-                gr.Markdown("- venv/conda 建议；- 首次失败优先看 Python 版本与 pip 源；- Windows 用 PowerShell；- CUDA 请核对 torch 对应版本。")
+                gr.Markdown("- 建议使用 venv/conda；- 首次失败优先检查 Python 版本与 pip 源；- Windows 用 PowerShell；- CUDA 请核对 torch 对应版本。")
 
     state_component = gr.State(init_state())
 
-    # 发送登录链接（后端生成链接并直接返回，方便无邮件服务时点击）
-    def request_magic_link(email):
-        if not email or "@" not in email:
-            return gr.update(value="请输入有效邮箱。")
-        upsert_user(email.strip())
-        token = create_magic_token(email.strip())
-        link = f"{APP_BASE_URL}/auth/verify?token={token}"
-        return gr.update(value=f"请点击登录完成验证：\n\n[{link}]({link})")
-    send_link_btn.click(request_magic_link, inputs=[login_email], outputs=[pay_msg])
+    # 发送验证码
+    import json as _json, urllib.request as _urlreq
+    def _post_json(url, payload):
+        data = _json.dumps(payload).encode("utf-8")
+        req = _urlreq.Request(url, data=data, headers={"Content-Type":"application/json"})
+        with _urlreq.urlopen(req, timeout=10) as r:
+            return _json.loads(r.read().decode("utf-8"))
 
-    # 用 JS 在浏览器里取 Cookie -> /auth/whoami
+    def send_code(email):
+        if not email or "@" not in email:
+            return gr.update(value="请输入有效邮箱")
+        try:
+            data = _post_json(f"{APP_BASE_URL}/auth/send_code", {"email": email})
+            return gr.update(value=data.get("msg","已发送"))
+        except Exception as e:
+            return gr.update(value=f"发送失败：{e}")
+
+    send_code_btn.click(send_code, inputs=[login_email], outputs=[pay_msg])
+
+    # 登录：提交验证码
+    def verify_code(email, code):
+        if not (email and code):
+            return gr.update(value="请输入邮箱和验证码")
+        try:
+            data = _post_json(f"{APP_BASE_URL}/auth/verify_code", {"email": email, "code": code})
+            if not data.get("ok"):
+                return gr.update(value="验证码错误或过期")
+            return gr.update(value="登录成功，正在同步账户…")
+        except Exception as e:
+            return gr.update(value=f"登录失败：{e}")
+
+    verify_btn.click(verify_code, inputs=[login_email, otp_input], outputs=[pay_msg])
+
+    # 用 JS 在浏览器里携带 Cookie 调 /auth/whoami
     js_fetch_whoami = """
     async () => {
       try{
@@ -419,30 +497,29 @@ with gr.Blocks(title="Repo AI 助手", theme=theme, css=CSS) as demo:
       }catch(e){ return ["", "0"]; }
     }
     """
-    load_session_btn.click(fn=None, inputs=None, outputs=[email_hidden, credits_hidden], js=js_fetch_whoami)
+    email_hidden = gr.Textbox(visible=False); credits_hidden = gr.Textbox(visible=False)
+    load_session_btn.click(None, None, [email_hidden, credits_hidden], js=js_fetch_whoami)
+    verify_btn.click(None, None, [email_hidden, credits_hidden], js=js_fetch_whoami)
+    demo.load(None, None, [email_hidden, credits_hidden], js=js_fetch_whoami)
 
-    # 页面加载时自动尝试读取登录态
-    demo.load(fn=None, inputs=None, outputs=[email_hidden, credits_hidden], js=js_fetch_whoami)
-
-    # 把隐藏框内容同步到 Python 状态和账户徽标
+    # 同步到 Python 状态
     def sync_session(email, credits, state):
         email = (email or "").strip()
         try: credits = int(credits)
         except: credits = 0
         if email:
-            state["user_email"] = email
-            state["user_credits"] = credits
+            state["user_email"] = email; state["user_credits"] = credits
             badge = f"**账户：{email} | 剩余次数：{credits}**"
         else:
-            state["user_email"] = ""
-            state["user_credits"] = 0
+            state["user_email"] = ""; state["user_credits"] = 0
             badge = "**账户：未登录 | 剩余次数：0**"
         return state, gr.update(value=badge)
+
     email_hidden.change(sync_session, inputs=[email_hidden, credits_hidden, state_component],
                         outputs=[state_component, acct_badge])
 
+    # 试用 / 购买 / 分析 / 其他
     trial_btn.click(claim_trial, inputs=[state_component], outputs=[pay_msg, state_component])
-
     buy_basic.click(lambda s: make_pay_link("BASIC", s), inputs=[state_component], outputs=pay_msg)
     buy_pro.click(  lambda s: make_pay_link("PRO",   s), inputs=[state_component], outputs=pay_msg)
 
@@ -460,14 +537,16 @@ with gr.Blocks(title="Repo AI 助手", theme=theme, css=CSS) as demo:
     export_sh_btn.click(export_script,   inputs=[state_component], outputs=[export_sh_file])
     export_json_btn.click(export_json,   inputs=[state_component], outputs=[export_json_file])
 
-    reset_btn.click(lambda: ([], gr.update(choices=[],value=[]), init_state(), "", "Windows", "", "",
-                             gr.update(value=None, visible=False), gr.update(value=None, visible=False),
-                             gr.update(value=None, visible=False), "**账户：未登录 | 剩余次数：0**",""),
-                    outputs=[chatbot, checklist, state_component, url_input, env_dropdown,
-                             cmds_md, step_detail_md, export_md_file, export_sh_file, export_json_file,
-                             acct_badge, pay_msg])
+    reset_btn.click(
+        lambda: ([], gr.update(choices=[],value=[]), init_state(), "", "Windows", "", "",
+                 gr.update(value=None, visible=False), gr.update(value=None, visible=False), gr.update(value=None, visible=False),
+                 "**账户：未登录 | 剩余次数：0**",""),
+        outputs=[chatbot, checklist, state_component, url_input, env_dropdown,
+                 cmds_md, step_detail_md, export_md_file, export_sh_file, export_json_file,
+                 acct_badge, pay_msg]
+    )
 
-# ---------- FastAPI ----------
+# ----------------- FastAPI 路由（Auth/Paddle/挂载） -----------------
 init_db()
 api = FastAPI()
 api.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
@@ -475,35 +554,72 @@ api.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, 
 @api.get("/", include_in_schema=False)
 async def root(): return RedirectResponse(url="/ui")
 
-@api.post("/auth/request")
-async def auth_request(data: dict):
-    email = (data or {}).get("email","").strip()
-    if "@" not in email: return JSONResponse({"ok":False,"error":"invalid_email"}, status_code=400)
-    upsert_user(email)
-    token = create_magic_token(email)
-    return {"ok": True, "verify_url": f"{APP_BASE_URL}/auth/verify?token={token}"}
+# 发送验证码（60秒节流）
+@api.post("/auth/send_code")
+async def auth_send_code(data: dict):
+    email = (data or {}).get("email", "").strip().lower()
+    if "@" not in email:
+        return JSONResponse({"ok": False, "error": "invalid_email"}, status_code=400)
 
-@api.get("/auth/verify")
-async def auth_verify(token: str = ""):
-    email = use_magic_token(token)
-    if not email:
-        return HTMLResponse("<h3>链接无效或已过期</h3>", status_code=400)
-    resp = RedirectResponse(url="/ui")
-    resp.set_cookie(SESSION_COOKIE, _sign(email),
-                    httponly=True, samesite="lax",
-                    secure=_is_https(APP_BASE_URL), max_age=7*24*3600)
+    now = int(time.time())
+    conn = db()
+    cur = conn.execute("SELECT created_at FROM otp_codes WHERE email=? ORDER BY created_at DESC LIMIT 1", (email,))
+    row = cur.fetchone()
+    if row and now - int(row["created_at"]) < 60:
+        conn.close()
+        return {"ok": True, "msg": "验证码已发送，请稍候再试"}
+
+    code = f"{secrets.randbelow(1000000):06d}"
+    expires = now + 10 * 60
+    conn.execute("INSERT INTO otp_codes(email, code, created_at, expires_at) VALUES(?,?,?,?)",
+                 (email, code, now, expires))
+    conn.commit(); conn.close()
+
+    sent = send_email_otp(email, code)
+    msg = "验证码已发送至邮箱，请查收" if sent else f"（测试环境）验证码：{code}"
+    upsert_user(email)
+    return {"ok": True, "msg": msg}
+
+# 验证登录（设置 Cookie）
+@api.post("/auth/verify_code")
+async def auth_verify_code(data: dict):
+    email = (data or {}).get("email", "").strip().lower()
+    code  = (data or {}).get("code", "").strip()
+    if not (email and code):
+        return JSONResponse({"ok": False, "error": "missing"}, status_code=400)
+
+    now = int(time.time())
+    conn = db()
+    cur = conn.execute("SELECT expires_at FROM otp_codes WHERE email=? AND code=?", (email, code))
+    row = cur.fetchone()
+    if not row:
+        conn.close(); return JSONResponse({"ok": False, "error": "invalid_code"}, status_code=400)
+    if now > int(row["expires_at"]):
+        conn.close(); return JSONResponse({"ok": False, "error": "expired"}, status_code=400)
+
+    conn.execute("DELETE FROM otp_codes WHERE email=?", (email,))
+    conn.commit(); conn.close()
+
+    resp = JSONResponse({"ok": True})
+    resp.set_cookie(
+        SESSION_COOKIE, _sign(email),
+        httponly=True, samesite="lax",
+        secure=_is_https(APP_BASE_URL), max_age=7*24*3600
+    )
     return resp
 
 @api.get("/auth/whoami")
 async def whoami(session: str | None = Cookie(default=None, alias=SESSION_COOKIE)):
     email = _unsign(session)
-    if not email: return {"ok":False, "email":None, "credits":0}
-    u = get_user(email) or {"credits":0}
-    return {"ok":True, "email":email, "credits":int(u.get("credits",0))}
+    if not email: return {"ok": False, "email": None, "credits": 0}
+    u = get_user(email) or {"credits": 0}
+    return {"ok": True, "email": email, "credits": int(u.get("credits", 0))}
 
+# Paddle 结账页 & Webhook
 def _checkout_html(price_id: str, plan: str, email: str) -> str:
     if not PADDLE_CLIENT_TOKEN or not price_id:
-        return """<!doctype html><meta charset='utf-8'><h3>Paddle 未配置</h3>"""
+        return """<!doctype html><meta charset='utf-8'><h3>Paddle 未配置</h3>
+        <p>请在环境变量设置 token 与 priceId 再试。</p>"""
     return f"""<!doctype html><html><head><meta charset="utf-8"/><title>Checkout - {plan}</title>
 <script src="https://cdn.paddle.com/paddle/v2/paddle.js"></script></head><body>
 <script>
@@ -517,7 +633,8 @@ def _checkout_html(price_id: str, plan: str, email: str) -> str:
   }});
   window.onload = openCheckout;
 </script>
-<p>若未自动弹出，请 <a href="#" onclick="openCheckout();return false;">点此重试</a>。</p></body></html>"""
+<p>若未自动弹出，请 <a href="#" onclick="openCheckout();return false;">点此重试</a>。</p>
+</body></html>"""
 
 @api.get("/paddle/checkout/basic", response_class=HTMLResponse)
 async def paddle_checkout_basic(email: str = ""): return HTMLResponse(_checkout_html(PADDLE_PRICE_BASIC,"BASIC",email))
@@ -551,10 +668,11 @@ async def paddle_webhook(request: Request):
             upsert_user(email); add_credits(email, total)
     return JSONResponse({"ok":True})
 
-# /ui 挂载 Gradio
+# 挂载 Gradio 在 /ui
 app = gr.mount_gradio_app(api, demo, path="/ui")
 
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT","7860"))
     uvicorn.run(app, host="0.0.0.0", port=port, proxy_headers=True, forwarded_allow_ips="*")
+
